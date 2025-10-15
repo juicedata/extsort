@@ -70,6 +70,9 @@ func makeCompareSortType(lessFunc CompareLessFunc) func(a, b SortType) int {
 // Returns the sorter instance, output channel with sorted items, and error channel.
 // This function provides backward compatibility with the original extsort API.
 //
+// IMPORTANT: The input channel MUST be closed to signal the end of data.
+// Sort() will continue reading from the input channel until it is closed.
+//
 // Deprecated: Use Generic() instead for new code. This function is maintained for backward compatibility.
 func New(input <-chan SortType, fromBytes FromBytes, lessFunc CompareLessFunc, config *Config) (*SortTypeSorter, <-chan SortType, <-chan error) {
 	// Convert legacy types to generic types

@@ -26,6 +26,9 @@ func toBytesString(s string) ([]byte, error) {
 // Strings performs external sorting on a channel of strings using lexicographic ordering.
 // Returns the sorter instance, output channel with sorted strings, and error channel.
 // This function provides backward compatibility with the legacy string-specific API.
+//
+// IMPORTANT: The input channel MUST be closed to signal the end of data.
+// Sort() will continue reading from the input channel until it is closed.
 func Strings(input <-chan string, config *Config) (*StringSorter, <-chan string, <-chan error) {
 	genericSorter, output, errChan := Generic(input, fromBytesString, toBytesString, cmp.Compare, config)
 	if genericSorter == nil {

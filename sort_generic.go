@@ -141,7 +141,7 @@ func (s *GenericSorter[E]) initMemoryPools() *memoryPools {
 // output channel with sorted results, and error channel.
 //
 // Parameters:
-//   - input: Channel providing the data to be sorted
+//   - input: Channel providing the data to be sorted. This channel MUST be closed when all data has been sent.
 //   - fromBytes: Function to deserialize E from bytes when reading from disk
 //   - toBytes: Function to serialize E to bytes when writing to disk
 //   - compareFunc: Comparison function that returns negative/zero/positive for less/equal/greater
@@ -156,6 +156,9 @@ func (s *GenericSorter[E]) initMemoryPools() *memoryPools {
 // Call Sort() on the returned sorter to begin the sorting process.
 // Results are delivered via the output channel, errors via the error channel.
 // On error or interruption, temporary files may remain in config.TempFilesDir.
+//
+// IMPORTANT: The input channel must be closed to signal completion. The Sort() method
+// will block until the input channel is closed. Failure to close it will cause a deadlock.
 func Generic[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes ToBytesGeneric[E], compareFunc CompareGeneric[E], config *Config) (*GenericSorter[E], <-chan E, <-chan error) {
 	var err error
 	s := newSorter(input, fromBytes, toBytes, compareFunc, config)
@@ -182,6 +185,11 @@ func MockGeneric[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes T
 // Sort sorts the Sorter's input chan and returns a new sorted chan, and error Chan
 // Sort is a chunking operation that runs multiple workers asynchronously
 // this blocks while sorting chunks and unblocks when merging
+//
+// IMPORTANT: The input channel MUST be closed to signal the end of data.
+// Sort will continue reading from the input channel until it is closed.
+// Failure to close the input channel will cause Sort to hang indefinitely.
+//
 // NOTE: the context passed to Sort must outlive Sort() returning.
 // Merge uses the same context and runs in a goroutine after Sort returns().
 // for example, if calling sort in an errGroup, you must pass the group's parent context into sort.

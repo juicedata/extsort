@@ -66,6 +66,9 @@ func (s *OrderedSorter[T]) toBytesOrdered(d T) ([]byte, error) {
 // Ordered performs external sorting on a channel of cmp.Ordered types.
 // It returns the sorter instance, output channel with sorted results, and error channel.
 // Uses gob encoding for serialization and the < operator for comparison.
+//
+// IMPORTANT: The input channel MUST be closed to signal the end of data.
+// Sort() will continue reading from the input channel until it is closed.
 func Ordered[T cmp.Ordered](input <-chan T, config *Config) (*OrderedSorter[T], <-chan T, <-chan error) {
 	orderedSorter := newOrderedSorter[T]()
 	s, output, errChan := Generic(input, orderedSorter.fromBytesOrdered, orderedSorter.toBytesOrdered, cmp.Compare, config)
