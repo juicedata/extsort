@@ -162,7 +162,11 @@ func (s *GenericSorter[E]) initMemoryPools() *memoryPools {
 func Generic[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes ToBytesGeneric[E], compareFunc CompareGeneric[E], config *Config) (*GenericSorter[E], <-chan E, <-chan error) {
 	var err error
 	s := newSorter(input, fromBytes, toBytes, compareFunc, config)
-	s.tempWriter, err = tempfile.New(s.config.TempFilesDir, true)
+	if s.config.Checksum {
+		s.tempWriter, err = tempfile.NewChecksummed(s.config.TempFilesDir, true)
+	} else {
+		s.tempWriter, err = tempfile.New(s.config.TempFilesDir, true)
+	}
 	if err != nil {
 		s.mergeErrChan <- err
 		close(s.mergeErrChan)
@@ -457,6 +461,7 @@ func (s *GenericSorter[E]) saveChunk(b *genericChunk[E]) error {
 // mergeNChunks runs asynchronously in the background feeding data to getNext
 // sends errors to s.mergeErrorChan. Uses parallel merging for better performance.
 func (s *GenericSorter[E]) mergeNChunks(ctx context.Context) {
+	defer close(s.mergeErrChan)
 	defer close(s.mergeChunkChan)
 	defer func() {
 		if s.tempReader != nil {
@@ -470,8 +475,6 @@ func (s *GenericSorter[E]) mergeNChunks(ctx context.Context) {
 			}
 		}
 	}()
-	// Always ensure error channel is closed
-	defer close(s.mergeErrChan)
 
 	if s.tempReader == nil {
 		return
@@ -504,12 +507,12 @@ func (s *GenericSorter[E]) mergeNChunksSingleThreaded(ctx context.Context) {
 			reader:    s.tempReader.Read(i),
 		}
 		_, ok, err := merge.getNext() // start the merge by preloading the values
-		if err == io.EOF || !ok {
-			continue
-		}
 		if err != nil {
 			s.mergeErrChan <- err
 			return
+		}
+		if !ok {
+			continue
 		}
 		pq.Push(merge)
 	}
@@ -640,11 +643,11 @@ func (s *GenericSorter[E]) mergeWorkerSimple(ctx context.Context, startChunk, en
 			reader:    s.tempReader.Read(i),
 		}
 		_, ok, err := merge.getNext()
-		if err == io.EOF || !ok {
-			continue
-		}
 		if err != nil {
 			return err
+		}
+		if !ok {
+			continue
 		}
 		pq.Push(merge)
 	}

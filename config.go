@@ -36,6 +36,10 @@ type Config struct {
 	//
 	// Default: "" (intelligent selection).
 	TempFilesDir string
+
+	// Checksum verifies temporary file blocks before records are returned by the
+	// merge phase. Default: false.
+	Checksum bool
 }
 
 // DefaultConfig returns a Config with sensible default values optimized for
