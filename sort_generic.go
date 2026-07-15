@@ -245,6 +245,20 @@ func (s *GenericSorter[E]) Sort(ctx context.Context) {
 	go s.mergeNChunks(ctx)
 }
 
+func (s *GenericSorter[E]) Next(ctx context.Context) (value E, ok bool, err error) {
+	select {
+	case value, ok = <-s.mergeChunkChan:
+		if ok {
+			return value, true, nil
+		}
+	case <-ctx.Done():
+		return value, false, ctx.Err()
+	}
+
+	err, _ = <-s.mergeErrChan
+	return value, false, err
+}
+
 // buildChunks reads data from the input chan to builds chunks and pushes them to chunkChan
 func (s *GenericSorter[E]) buildChunks() error {
 	defer close(s.chunkChan) // if this is not called on error, causes a deadlock
