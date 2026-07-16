@@ -15,6 +15,7 @@ type checksumWriter struct {
 	blockSize     int
 	blockChecksum uint32
 	checksums     []uint32
+	buf           []byte
 }
 
 func (w *checksumWriter) write(dst *bufio.Writer, p []byte) (int, error) {
@@ -44,11 +45,16 @@ func (w *checksumWriter) write(dst *bufio.Writer, p []byte) (int, error) {
 }
 
 func (w *checksumWriter) writeString(dst *bufio.Writer, s string) (int, error) {
-	buf := make([]byte, min(len(s), checksumBlockSize))
+	bufSize := min(len(s), checksumBlockSize)
+	if cap(w.buf) < bufSize {
+		w.buf = make([]byte, bufSize)
+	} else {
+		w.buf = w.buf[:bufSize]
+	}
 	written := 0
 	for len(s) > 0 {
-		n := copy(buf, s)
-		m, err := w.write(dst, buf[:n])
+		n := copy(w.buf, s)
+		m, err := w.write(dst, w.buf[:n])
 		if err != nil {
 			return 0, err
 		}
