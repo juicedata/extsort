@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"slices"
 	"sync"
@@ -198,9 +199,12 @@ func MockGeneric[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes T
 // Merge uses the same context and runs in a goroutine after Sort returns().
 // for example, if calling sort in an errGroup, you must pass the group's parent context into sort.
 func (s *GenericSorter[E]) Sort(ctx context.Context) {
+	sortCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var buildSortErrGroup, saveErrGroup *errgroup.Group
-	buildSortErrGroup, s.buildSortCtx = errgroup.WithContext(ctx)
-	saveErrGroup, s.saveCtx = errgroup.WithContext(ctx)
+	buildSortErrGroup, s.buildSortCtx = errgroup.WithContext(sortCtx)
+	saveErrGroup, s.saveCtx = errgroup.WithContext(sortCtx)
 
 	//start creating chunks
 	buildSortErrGroup.Go(s.buildChunks)
@@ -211,22 +215,34 @@ func (s *GenericSorter[E]) Sort(ctx context.Context) {
 	}
 
 	// Start the save worker that will handle single-chunk optimization
-	saveErrGroup.Go(s.saveChunksOptimized)
+	saveErrGroup.Go(func() error {
+		err := s.saveChunksOptimized()
+		if err != nil {
+			cancel()
+		}
+		return err
+	})
 
-	err := buildSortErrGroup.Wait()
-	if err != nil {
-		s.mergeErrChan <- err
-		close(s.mergeErrChan)
-		close(s.mergeChunkChan)
-		return
+	buildErr := buildSortErrGroup.Wait()
+	if buildErr != nil {
+		cancel()
 	}
 
 	// Close saveChunkChan to signal end of chunks
 	close(s.saveChunkChan)
 
 	// Wait for save worker to complete
-	err = saveErrGroup.Wait()
+	saveErr := saveErrGroup.Wait()
+	err := buildErr
+	if saveErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
+		err = saveErr
+	}
 	if err != nil {
+		if s.tempReader != nil {
+			_ = s.tempReader.Close()
+		} else {
+			_ = s.tempWriter.Close()
+		}
 		s.mergeErrChan <- err
 		close(s.mergeErrChan)
 		close(s.mergeChunkChan)
