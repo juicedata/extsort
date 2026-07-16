@@ -26,19 +26,17 @@ func (w *checksumWriter) write(dst *bufio.Writer, p []byte) (int, error) {
 		}
 		chunk := p[:blockRemaining]
 		n, err := dst.Write(chunk)
-		if n > 0 {
-			w.blockChecksum = crc32.Update(w.blockChecksum, checksumTable, chunk[:n])
-			w.blockSize += n
+		if err != nil {
+			return 0, err
 		}
+		if n != len(chunk) {
+			return 0, io.ErrShortWrite
+		}
+		w.blockChecksum = crc32.Update(w.blockChecksum, checksumTable, chunk)
+		w.blockSize += n
 		written += n
 		if w.blockSize == checksumBlockSize {
 			w.finishBlock()
-		}
-		if err != nil {
-			return written, err
-		}
-		if n != len(chunk) {
-			return written, io.ErrShortWrite
 		}
 		p = p[n:]
 	}
@@ -51,10 +49,10 @@ func (w *checksumWriter) writeString(dst *bufio.Writer, s string) (int, error) {
 	for len(s) > 0 {
 		n := copy(buf, s)
 		m, err := w.write(dst, buf[:n])
-		written += m
 		if err != nil {
-			return written, err
+			return 0, err
 		}
+		written += m
 		s = s[m:]
 	}
 	return written, nil
