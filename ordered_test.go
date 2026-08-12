@@ -3,6 +3,7 @@ package extsort_test
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/lanrat/extsort"
@@ -238,5 +239,34 @@ done5:
 
 	if len(result) != 0 {
 		t.Errorf("Expected empty result, got %v", result)
+	}
+}
+
+func TestOrderedWithChecksum(t *testing.T) {
+	input := make(chan int, 6)
+	for _, value := range []int{6, 1, 5, 2, 4, 3} {
+		input <- value
+	}
+	close(input)
+
+	config := extsort.DefaultConfig()
+	config.ChunkSize = 2
+	config.TempFilesDir = t.TempDir()
+	config.Checksum = true
+
+	sorter, output, errChan := extsort.Ordered(input, config)
+	sorter.Sort(context.Background())
+
+	var got []int
+	for value := range output {
+		got = append(got, value)
+	}
+	if err := <-errChan; err != nil {
+		t.Fatal(err)
+	}
+
+	want := []int{1, 2, 3, 4, 5, 6}
+	if !slices.Equal(got, want) {
+		t.Fatalf("sorted values = %v, want %v", got, want)
 	}
 }

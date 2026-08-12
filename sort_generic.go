@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"slices"
 	"sync"
@@ -162,7 +163,11 @@ func (s *GenericSorter[E]) initMemoryPools() *memoryPools {
 func Generic[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes ToBytesGeneric[E], compareFunc CompareGeneric[E], config *Config) (*GenericSorter[E], <-chan E, <-chan error) {
 	var err error
 	s := newSorter(input, fromBytes, toBytes, compareFunc, config)
-	s.tempWriter, err = tempfile.New(s.config.TempFilesDir, true)
+	if s.config.Checksum {
+		s.tempWriter, err = tempfile.NewChecksummed(s.config.TempFilesDir, true)
+	} else {
+		s.tempWriter, err = tempfile.New(s.config.TempFilesDir, true)
+	}
 	if err != nil {
 		s.mergeErrChan <- err
 		close(s.mergeErrChan)
@@ -194,9 +199,12 @@ func MockGeneric[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes T
 // Merge uses the same context and runs in a goroutine after Sort returns().
 // for example, if calling sort in an errGroup, you must pass the group's parent context into sort.
 func (s *GenericSorter[E]) Sort(ctx context.Context) {
+	sortCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var buildSortErrGroup, saveErrGroup *errgroup.Group
-	buildSortErrGroup, s.buildSortCtx = errgroup.WithContext(ctx)
-	saveErrGroup, s.saveCtx = errgroup.WithContext(ctx)
+	buildSortErrGroup, s.buildSortCtx = errgroup.WithContext(sortCtx)
+	saveErrGroup, s.saveCtx = errgroup.WithContext(sortCtx)
 
 	//start creating chunks
 	buildSortErrGroup.Go(s.buildChunks)
@@ -207,22 +215,34 @@ func (s *GenericSorter[E]) Sort(ctx context.Context) {
 	}
 
 	// Start the save worker that will handle single-chunk optimization
-	saveErrGroup.Go(s.saveChunksOptimized)
+	saveErrGroup.Go(func() error {
+		err := s.saveChunksOptimized()
+		if err != nil {
+			cancel()
+		}
+		return err
+	})
 
-	err := buildSortErrGroup.Wait()
-	if err != nil {
-		s.mergeErrChan <- err
-		close(s.mergeErrChan)
-		close(s.mergeChunkChan)
-		return
+	buildErr := buildSortErrGroup.Wait()
+	if buildErr != nil {
+		cancel()
 	}
 
 	// Close saveChunkChan to signal end of chunks
 	close(s.saveChunkChan)
 
 	// Wait for save worker to complete
-	err = saveErrGroup.Wait()
+	saveErr := saveErrGroup.Wait()
+	err := buildErr
+	if saveErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
+		err = saveErr
+	}
 	if err != nil {
+		if s.tempReader != nil {
+			_ = s.tempReader.Close()
+		} else {
+			_ = s.tempWriter.Close()
+		}
 		s.mergeErrChan <- err
 		close(s.mergeErrChan)
 		close(s.mergeChunkChan)
@@ -239,6 +259,20 @@ func (s *GenericSorter[E]) Sort(ctx context.Context) {
 	// Multiple chunks: read chunks and merge
 	// if this errors, it is returned in the errorChan
 	go s.mergeNChunks(ctx)
+}
+
+func (s *GenericSorter[E]) Next(ctx context.Context) (value E, ok bool, err error) {
+	select {
+	case value, ok = <-s.mergeChunkChan:
+		if ok {
+			return value, true, nil
+		}
+	case <-ctx.Done():
+		return value, false, ctx.Err()
+	}
+
+	err, _ = <-s.mergeErrChan
+	return value, false, err
 }
 
 // buildChunks reads data from the input chan to builds chunks and pushes them to chunkChan
@@ -457,6 +491,7 @@ func (s *GenericSorter[E]) saveChunk(b *genericChunk[E]) error {
 // mergeNChunks runs asynchronously in the background feeding data to getNext
 // sends errors to s.mergeErrorChan. Uses parallel merging for better performance.
 func (s *GenericSorter[E]) mergeNChunks(ctx context.Context) {
+	defer close(s.mergeErrChan)
 	defer close(s.mergeChunkChan)
 	defer func() {
 		if s.tempReader != nil {
@@ -470,8 +505,6 @@ func (s *GenericSorter[E]) mergeNChunks(ctx context.Context) {
 			}
 		}
 	}()
-	// Always ensure error channel is closed
-	defer close(s.mergeErrChan)
 
 	if s.tempReader == nil {
 		return
@@ -504,12 +537,12 @@ func (s *GenericSorter[E]) mergeNChunksSingleThreaded(ctx context.Context) {
 			reader:    s.tempReader.Read(i),
 		}
 		_, ok, err := merge.getNext() // start the merge by preloading the values
-		if err == io.EOF || !ok {
-			continue
-		}
 		if err != nil {
 			s.mergeErrChan <- err
 			return
+		}
+		if !ok {
+			continue
 		}
 		pq.Push(merge)
 	}
@@ -640,11 +673,11 @@ func (s *GenericSorter[E]) mergeWorkerSimple(ctx context.Context, startChunk, en
 			reader:    s.tempReader.Read(i),
 		}
 		_, ok, err := merge.getNext()
-		if err == io.EOF || !ok {
-			continue
-		}
 		if err != nil {
 			return err
+		}
+		if !ok {
+			continue
 		}
 		pq.Push(merge)
 	}
