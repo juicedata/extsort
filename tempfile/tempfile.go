@@ -75,19 +75,26 @@ var (
 type FileWriter struct {
 	file         *os.File
 	bufWriter    *bufio.Writer
-	sections     []int64
+	sections     []sectionMeta
 	pending      bool   // data was written since the last Next
 	needsCleanup bool   // true if manual cleanup is needed (Windows)
 	createdDir   string // directory we created (for cleanup)
+	checksum     *checksumWriter
+}
+
+type sectionMeta struct {
+	end       int64
+	checksums []uint32
 }
 
 type fileReader struct {
 	file         *os.File
-	sections     []int64
+	sections     []sectionMeta
 	readers      []*bufio.Reader // created by Read on first use
 	needsCleanup bool            // true if manual cleanup is needed (Windows)
 	filename     string          // filename for cleanup
 	createdDir   string          // directory we created (for cleanup), taken over from the FileWriter
+	checksummed  bool
 }
 
 // New creates a new FileWriter for virtual temporary files in the specified directory.
@@ -96,8 +103,21 @@ type fileReader struct {
 // The function attempts automatic cleanup on Unix systems by unlinking the file immediately,
 // while Windows requires explicit cleanup when the FileWriter is closed.
 func New(dir string, preferDiskBacked bool) (*FileWriter, error) {
+	return newFileWriter(dir, preferDiskBacked, false)
+}
+
+// NewChecksummed creates a FileWriter that verifies each temporary file block
+// before returning its contents to readers.
+func NewChecksummed(dir string, preferDiskBacked bool) (*FileWriter, error) {
+	return newFileWriter(dir, preferDiskBacked, true)
+}
+
+func newFileWriter(dir string, preferDiskBacked, checksummed bool) (*FileWriter, error) {
 	var w FileWriter
 	var err error
+	if checksummed {
+		w.checksum = &checksumWriter{}
+	}
 
 	// Use intelligent directory selection if no specific directory provided
 	selectedDir := GetTempDir(dir, preferDiskBacked)
@@ -133,7 +153,7 @@ func New(dir string, preferDiskBacked bool) (*FileWriter, error) {
 	}
 
 	w.bufWriter = bufio.NewWriterSize(w.file, fileBufferSize)
-	w.sections = make([]int64, 0, 10)
+	w.sections = make([]sectionMeta, 0, 10)
 
 	return &w, nil
 }
@@ -163,6 +183,7 @@ func (w *FileWriter) Close() error {
 	err := w.file.Close()
 	w.sections = nil
 	w.bufWriter = nil
+	w.checksum = nil
 
 	// Only attempt manual cleanup if needed (Windows case)
 	if w.needsCleanup {
@@ -183,7 +204,13 @@ func (w *FileWriter) Close() error {
 // Write appends data to the current virtual file section.
 // Data is buffered for efficiency and will be flushed when Next() or Save() is called.
 func (w *FileWriter) Write(p []byte) (int, error) {
-	n, err := w.bufWriter.Write(p)
+	var n int
+	var err error
+	if w.checksum != nil {
+		n, err = w.checksum.write(w.bufWriter, p)
+	} else {
+		n, err = w.bufWriter.Write(p)
+	}
 	if n > 0 {
 		w.pending = true
 	}
@@ -191,9 +218,15 @@ func (w *FileWriter) Write(p []byte) (int, error) {
 }
 
 // WriteString appends a string to the current virtual file section.
-// This is more efficient than Write() for string data as it avoids byte slice conversion.
+// Without checksumming it avoids a byte slice conversion.
 func (w *FileWriter) WriteString(s string) (int, error) {
-	n, err := w.bufWriter.WriteString(s)
+	var n int
+	var err error
+	if w.checksum != nil {
+		n, err = w.checksum.writeString(w.bufWriter, s)
+	} else {
+		n, err = w.bufWriter.WriteString(s)
+	}
 	if n > 0 {
 		w.pending = true
 	}
@@ -204,6 +237,10 @@ func (w *FileWriter) WriteString(s string) (int, error) {
 // It flushes buffered data and records the section boundary for later reading.
 // Returns the file offset where the next section will begin.
 func (w *FileWriter) Next() (int64, error) {
+	var checksums []uint32
+	if w.checksum != nil {
+		checksums = w.checksum.finishSection()
+	}
 	// save offsets
 	err := w.bufWriter.Flush()
 	if err != nil {
@@ -213,7 +250,7 @@ func (w *FileWriter) Next() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	w.sections = append(w.sections, pos)
+	w.sections = append(w.sections, sectionMeta{end: pos, checksums: checksums})
 	w.pending = false
 
 	return pos, nil
@@ -243,10 +280,10 @@ func (w *FileWriter) Save() (TempReader, error) {
 		if err != nil {
 			return nil, err
 		}
-		r, err = newTempReader(filename, w.sections, w.needsCleanup)
+		r, err = newTempReader(filename, w.sections, w.checksum != nil, w.needsCleanup)
 	} else {
 		// Unix case: file is unlinked, reuse the same file handle
-		r, err = newTempReaderFromFile(w.file, w.sections, w.needsCleanup)
+		r, err = newTempReaderFromFile(w.file, w.sections, w.checksum != nil, w.needsCleanup)
 	}
 	if err != nil {
 		return nil, err
@@ -260,7 +297,7 @@ func (w *FileWriter) Save() (TempReader, error) {
 
 // newTempReader creates a TempReader by opening a file by name.
 // This is used on Windows where files need to be closed and reopened for reading.
-func newTempReader(filename string, sections []int64, needsCleanup bool) (*fileReader, error) {
+func newTempReader(filename string, sections []sectionMeta, checksummed, needsCleanup bool) (*fileReader, error) {
 	// create TempReader by opening file by name
 	var err error
 	var r fileReader
@@ -272,13 +309,14 @@ func newTempReader(filename string, sections []int64, needsCleanup bool) (*fileR
 	r.readers = make([]*bufio.Reader, len(r.sections))
 	r.needsCleanup = needsCleanup
 	r.filename = filename
+	r.checksummed = checksummed
 
 	return &r, nil
 }
 
 // newTempReaderFromFile creates a TempReader by reusing an existing file handle.
 // This is used on Unix systems where unlinked files can continue to be accessed.
-func newTempReaderFromFile(file *os.File, sections []int64, needsCleanup bool) (*fileReader, error) {
+func newTempReaderFromFile(file *os.File, sections []sectionMeta, checksummed, needsCleanup bool) (*fileReader, error) {
 	// create TempReader by reusing existing file handle
 	var r fileReader
 	r.file = file
@@ -286,6 +324,7 @@ func newTempReaderFromFile(file *os.File, sections []int64, needsCleanup bool) (
 	r.readers = make([]*bufio.Reader, len(r.sections))
 	r.needsCleanup = needsCleanup
 	r.filename = file.Name()
+	r.checksummed = checksummed
 
 	return &r, nil
 }
@@ -329,9 +368,15 @@ func (r *fileReader) Read(i int) *bufio.Reader {
 	if r.readers[i] == nil {
 		var start int64
 		if i > 0 {
-			start = r.sections[i-1]
+			start = r.sections[i-1].end
 		}
-		r.readers[i] = newSectionReader(r.file, start, r.sections[i], len(r.sections))
+		meta := r.sections[i]
+		if r.checksummed {
+			section := io.NewSectionReader(r.file, start, meta.end-start)
+			r.readers[i] = newChecksummedReader(section, i, meta.checksums, meta.end-start)
+		} else {
+			r.readers[i] = newSectionReader(r.file, start, meta.end, len(r.sections))
+		}
 	}
 	return r.readers[i]
 }

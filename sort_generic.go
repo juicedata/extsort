@@ -183,7 +183,13 @@ func Generic[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes ToByt
 	s := newSorter(input, fromBytes, toBytes, compareFunc, config)
 	dir := s.config.TempFilesDir
 	s.newTempWriter = func() (tempfile.TempWriter, error) {
-		w, err := tempfile.New(dir, true)
+		var w *tempfile.FileWriter
+		var err error
+		if s.config.Checksum {
+			w, err = tempfile.NewChecksummed(dir, true)
+		} else {
+			w, err = tempfile.New(dir, true)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -265,6 +271,20 @@ func (s *GenericSorter[E]) Sort(ctx context.Context) {
 	// Multiple chunks: read chunks and merge
 	// if this errors, it is returned in the errorChan
 	go s.mergeNChunks(ctx)
+}
+
+func (s *GenericSorter[E]) Next(ctx context.Context) (value E, ok bool, err error) {
+	select {
+	case value, ok = <-s.mergeChunkChan:
+		if ok {
+			return value, true, nil
+		}
+	case <-ctx.Done():
+		return value, false, ctx.Err()
+	}
+
+	err, _ = <-s.mergeErrChan
+	return value, false, err
 }
 
 // closeTempFiles releases the temp file on paths that never reach the merge.
