@@ -9,6 +9,7 @@ import (
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/lanrat/extsort/queue"
 	"github.com/lanrat/extsort/tempfile"
@@ -21,6 +22,9 @@ import (
 type genericChunk[E any] struct {
 	data []E
 }
+
+// initialChunkCapacity is the initial capacity of a chunk buffer.
+const initialChunkCapacity = 1024
 
 // getChunk retrieves a chunk from the pool and initializes it
 func (s *GenericSorter[E]) getChunk() *genericChunk[E] {
@@ -49,10 +53,11 @@ func (s *GenericSorter[E]) putChunk(c *genericChunk[E]) {
 
 // memoryPools holds sync.Pool instances for memory reuse
 type memoryPools struct {
-	chunkPool     sync.Pool // *chunk objects
-	slicePool     sync.Pool // []any slices
-	byteSlicePool sync.Pool // []byte slices for serialization
-	scratchPool   sync.Pool // scratch buffers for binary encoding
+	chunkPool     sync.Pool   // *chunk objects
+	slicePool     sync.Pool   // []any slices
+	byteSlicePool sync.Pool   // []byte slices for serialization
+	scratchPool   sync.Pool   // scratch buffers for binary encoding
+	chunkFilled   atomic.Bool // set once a chunk reaches ChunkSize
 }
 
 // GenericSorter implements external sorting for any type E using a divide-and-conquer approach.
@@ -111,10 +116,15 @@ func (s *GenericSorter[E]) initMemoryPools() *memoryPools {
 		},
 	}
 
-	// Pool for slices - store pointers to slices
+	// Pool for slices - store pointers to slices. They start small and grow
+	// as needed so that small inputs stay cheap, until a chunk is filled.
 	pools.slicePool = sync.Pool{
 		New: func() any {
-			slice := make([]E, 0, s.config.ChunkSize)
+			capacity := s.config.ChunkSize
+			if !pools.chunkFilled.Load() {
+				capacity = min(capacity, initialChunkCapacity)
+			}
+			slice := make([]E, 0, capacity)
 			return &slice
 		},
 	}
@@ -156,25 +166,23 @@ func (s *GenericSorter[E]) initMemoryPools() *memoryPools {
 //
 // Call Sort() on the returned sorter to begin the sorting process.
 // Results are delivered via the output channel, errors via the error channel.
+// The temporary file is only created once the input needs more than one chunk,
+// so a failure to create it is also reported via the error channel.
 // On error or interruption, temporary files may remain in config.TempFilesDir.
 //
 // IMPORTANT: The input channel must be closed to signal completion. The Sort() method
 // will block until the input channel is closed. Failure to close it will cause a deadlock.
 func Generic[E any](input <-chan E, fromBytes FromBytesGeneric[E], toBytes ToBytesGeneric[E], compareFunc CompareGeneric[E], config *Config) (*GenericSorter[E], <-chan E, <-chan error) {
-	var err error
 	s := newSorter(input, fromBytes, toBytes, compareFunc, config)
-	if s.config.Checksum {
-		s.tempWriter, err = tempfile.NewChecksummed(s.config.TempFilesDir, true)
-	} else {
-		s.tempWriter, err = tempfile.New(s.config.TempFilesDir, true)
-	}
-	if err != nil {
-		s.mergeErrChan <- err
-		close(s.mergeErrChan)
-		close(s.mergeChunkChan)
-		return nil, s.mergeChunkChan, s.mergeErrChan
-	}
 	return s, s.mergeChunkChan, s.mergeErrChan
+}
+
+// newTempWriter creates the temporary file for saving chunks.
+func (s *GenericSorter[E]) newTempWriter() (tempfile.TempWriter, error) {
+	if s.config.Checksum {
+		return tempfile.NewChecksummed(s.config.TempFilesDir, true)
+	}
+	return tempfile.New(s.config.TempFilesDir, true)
 }
 
 // MockGeneric creates an external sorter that uses in-memory storage instead of disk files.
@@ -240,7 +248,7 @@ func (s *GenericSorter[E]) Sort(ctx context.Context) {
 	if err != nil {
 		if s.tempReader != nil {
 			_ = s.tempReader.Close()
-		} else {
+		} else if s.tempWriter != nil {
 			_ = s.tempWriter.Close()
 		}
 		s.mergeErrChan <- err
@@ -279,19 +287,24 @@ func (s *GenericSorter[E]) Next(ctx context.Context) (value E, ok bool, err erro
 func (s *GenericSorter[E]) buildChunks() error {
 	defer close(s.chunkChan) // if this is not called on error, causes a deadlock
 
-	for {
+	for inputDone := false; !inputDone; {
 		c := s.getChunk()
-		for i := 0; i < s.config.ChunkSize; i++ {
+	fill:
+		for len(c.data) < s.config.ChunkSize {
 			select {
 			case rec, ok := <-s.input:
 				if !ok {
-					break
+					inputDone = true
+					break fill
 				}
 				c.data = append(c.data, rec)
 			case <-s.buildSortCtx.Done():
 				s.putChunk(c) // Return unused chunk to pool
 				return s.buildSortCtx.Err()
 			}
+		}
+		if len(c.data) == s.config.ChunkSize {
+			s.pools.chunkFilled.Store(true)
 		}
 		if len(c.data) == 0 {
 			// the chunk is empty, return it to pool
@@ -421,6 +434,15 @@ func (s *GenericSorter[E]) saveChunksOptimized() error {
 	}
 
 	// We have at least 2 chunks - use multi-chunk path
+	if s.tempWriter == nil {
+		w, err := s.newTempWriter()
+		if err != nil {
+			s.putChunk(firstChunk)
+			s.putChunk(secondChunk)
+			return NewDiskError(err, "create temp file", s.config.TempFilesDir)
+		}
+		s.tempWriter = w
+	}
 	// Save the first chunk
 	if err := s.saveChunk(firstChunk); err != nil {
 		s.putChunk(secondChunk) // Return to pool
